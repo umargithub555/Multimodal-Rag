@@ -1,0 +1,206 @@
+<!-- <!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quiz Generator - Learning Platform</title>
+    <link rel="stylesheet" href="static/styles.css">
+</head>
+<body>
+    
+    <nav class="navbar">
+        <div class="nav-container">
+            <div class="logo">
+                <h1>📚 Quiz Generator</h1>
+            </div>
+            <div class="nav-links">
+                <button class="nav-btn active" data-page="learning">Learning</button>
+                <button class="nav-btn" data-page="quiz">Quiz Generator</button>
+            </div>
+        </div>
+    </nav>
+
+    
+    <div id="learning-page" class="page active">
+        <div class="container">
+            <div class="page-header">
+                <h2>Learning Assistant</h2>
+                <p>Ask questions about your study material and get AI-powered answers</p>
+            </div>
+            
+            <div class="learning-container">
+                <div class="question-section">
+                    <div class="input-group">
+                        <label for="question-input">Your Question</label>
+                        <textarea 
+                            id="question-input" 
+                            class="question-input" 
+                            placeholder="Enter your question here... (e.g., Explain the concept of photosynthesis)"
+                            rows="4"
+                        ></textarea>
+                    </div>
+                    <button id="ask-btn" class="primary-btn">
+                        <span>Ask Question</span>
+                        <span class="btn-icon">→</span>
+                    </button>
+                </div>
+
+                <div id="answer-section" class="answer-section">
+                    <div class="answer-placeholder">
+                        <div class="placeholder-icon">💡</div>
+                        <p>Your answer will appear here after you ask a question</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="quiz-page" class="page">
+        <div class="container">
+            <div class="page-header">
+                <h2>Quiz Generator</h2>
+                <p>Select a chapter to generate a quiz based on your study material</p>
+            </div>
+            
+            <div class="quiz-container">
+                <div class="quiz-controls">
+                    <div class="input-group">
+                        <label for="chapter-select">Select Chapter</label>
+                        <select id="chapter-select" class="chapter-select">
+                            <option value="">-- Choose a Chapter --</option>
+                            <option value="chapter1">Chapter 1</option>
+                            <option value="chapter2">Chapter 2</option>
+                            <option value="chapter3">Chapter 3</option>
+                            <option value="chapter4">Chapter 4</option>
+                            <option value="chapter5">Chapter 5</option>
+                        </select>
+                    </div>
+                    <button id="generate-btn" class="primary-btn" disabled>
+                        <span>Generate Quiz</span>
+                        <span class="btn-icon">📝</span>
+                    </button>
+                </div>
+
+                <div id="quiz-section" class="quiz-section">
+                    <div class="quiz-placeholder">
+                        <div class="placeholder-icon">📋</div>
+                        <p>Select a chapter and click "Generate Quiz" to create your quiz</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    
+    <div id="loading-overlay" class="loading-overlay hidden">
+        <div class="spinner"></div>
+        <p>Processing your request...</p>
+    </div>
+
+    <script src="static/script.js"></script>
+</body>
+</html>
+ -->
+
+
+
+ <!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quiz Generator - Learning Platform</title>
+    <link rel="stylesheet" href="static/styles.css">
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar">
+        <div class="nav-container">
+            <div class="logo">
+                <h1>📚 Quiz Generator</h1>
+            </div>
+            <div class="nav-links">
+                <button class="nav-btn active" data-page="learning">Learning</button>
+                <button class="nav-btn" data-page="quiz">Quiz Generator</button>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Learning Page -->
+    <div id="learning-page" class="page active">
+        <div class="container">
+            <div class="page-header">
+                <h2>Learning Assistant</h2>
+                <p>Ask questions about your study material and get AI-powered answers</p>
+            </div>
+            
+            <div class="learning-container">
+                <div class="question-section">
+                    <div class="input-group">
+                        <label for="question-input">Your Question</label>
+                        <textarea 
+                            id="question-input" 
+                            class="question-input" 
+                            placeholder="Enter your question here... (e.g., Explain the concept of photosynthesis)"
+                            rows="4"
+                        ></textarea>
+                    </div>
+                    <button id="ask-btn" class="primary-btn">
+                        <span>Ask Question</span>
+                        <span class="btn-icon">→</span>
+                    </button>
+                </div>
+
+                <div id="answer-section" class="answer-section">
+                    <div class="answer-placeholder">
+                        <div class="placeholder-icon">💡</div>
+                        <p>Your answer will appear here after you ask a question</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Quiz Generator Page -->
+    <div id="quiz-page" class="page">
+        <div class="container">
+            <div class="page-header">
+                <h2>Quiz Generator</h2>
+                <p>Select a chapter to generate questions and test your knowledge</p>
+                <p>Note! these chapters are not the one presented in the orignal book. These are semantic chapters extracted after processing.</p>
+            </div>
+            
+            <div class="quiz-container">
+                <div class="quiz-controls">
+                    <div class="input-group">
+                        <label for="chapter-select">Select Chapter</label>
+                        <select id="chapter-select" class="chapter-select">
+                            <option value="">-- Choose a Chapter --</option>
+                        </select>
+                    </div>
+                    <button id="generate-btn" class="primary-btn" disabled>
+                        <span>Generate Quiz</span>
+                        <span class="btn-icon">📝</span>
+                    </button>
+                </div>
+
+                <div id="quiz-section" class="quiz-section">
+                    <div class="quiz-placeholder">
+                        <div class="placeholder-icon">📋</div>
+                        <p>Select a chapter and click "Generate Quiz" to create your quiz</p>
+                       
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay" class="loading-overlay hidden">
+        <div class="spinner"></div>
+        <p>Processing your request...</p>
+    </div>
+
+    <script src="static/script.js"></script>
+</body>
+</html>
