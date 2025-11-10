@@ -35,7 +35,8 @@ load_dotenv()
 CHROMA_DB_PATH = "./chroma_db"
 COLLECTION_NAME = "pdf_chapter_embeddings"
 MODEL_NAME = "nomic-ai/nomic-embed-text-v1"
-CHAPTERS_FILE = "output/semantic_chapters.json"
+# CHAPTERS_FILE = "output/semantic_chapters.json"
+CHAPTERS_FILE= 'output/regex_chapters.json'
 GEMINI_MODEL = "gemini-2.0-flash"
 
 
@@ -390,7 +391,7 @@ def get_chapters():
     chapter_list = [
         {
             "number": ch["chapter_number"],
-            "title": ch.get("title", f"Chapter {ch['chapter_number']}"),
+            "title": ch.get("title", f"{ch['chapter_title']}"),
             "value": f"chapter{ch['chapter_number']}"
         }
         for ch in chapters

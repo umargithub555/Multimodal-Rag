@@ -1793,9 +1793,10 @@
                 
                 chaptersArray.forEach(chapter => {
                     const option = document.createElement('option');
+
                     option.value = chapter.value;
                     // Ensure these properties (number, title) exist in your API response
-                    option.textContent = `Chapter ${chapter.number}`;
+                    option.textContent = `${chapter.title}`;
                     select.appendChild(option);
                 });
             } catch (error) {
