@@ -1,3 +1,6 @@
+import base64
+import mimetypes
+import re
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse,JSONResponse,StreamingResponse
@@ -13,13 +16,14 @@ from sentence_transformers import SentenceTransformer
 # import google.generativeai as 
 from langchain_google_genai import ChatGoogleGenerativeAI 
 from langchain_core.messages import HumanMessage
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
 import threading
 from eleven_tts import ElevenTTS
 import speech_recognition as sr
+from pathlib import Path
 from multimodal_pipeline import (
     process_book,
     rebuild_embeddings,
@@ -36,9 +40,12 @@ CHROMA_DB_PATH = "./chroma_db"
 COLLECTION_NAME = "pdf_chapter_embeddings"
 MODEL_NAME = "nomic-ai/nomic-embed-text-v1"
 # CHAPTERS_FILE = "output/semantic_chapters.json"
-CHAPTERS_FILE= 'output/regex_chapters.json'
+# CHAPTERS_FILE= 'output/regex_chapters.json'
 GEMINI_MODEL = "gemini-2.0-flash"
-
+CHAPTERS_FILE = "output/regex_chapters.json"
+TEXTS_FILE = "output/texts.json"
+IMAGES_ROOT = (Path.cwd() / "output" / "images").resolve()
+MAX_IMAGE_QUESTIONS = 3
 
 UPLOAD_FOLDER = "./uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -48,11 +55,12 @@ nomic_ef = None
 chroma_client = None
 collection = None
 chapters = []
+page_text_map: Dict[int, str] = {}
 retriever = None
 elevenlabs_client = None
 google_api_key = None  # Added for multimodal pipeline
 model_loaded_event = None  
-
+elevenlabs_client = None
 
 
 # --- Request Models ---
@@ -66,6 +74,7 @@ class AnswerEvaluationRequest(BaseModel):
     question: str
     user_answer: str
     chapter_context: str
+    image_base64: str = None
 
 
 class InterviewGenerateRequest(BaseModel):
@@ -95,6 +104,18 @@ class InterviewResponseRequest(BaseModel):
     current_stage: str  # "greeting", "introduction", "question", "closing"
 
 
+# 1. Define the message format (must match what the front-end sends)
+class ChatMessage(BaseModel):
+    role: str # 'user' or 'assistant'
+    content: str
+
+# 2. Define the full request body structure
+class ChatRequest(BaseModel):
+    question: str
+ # Assuming this is still needed for context selection
+    messages: List[ChatMessage] # This is the conversation history
+
+
 
 
 
@@ -122,7 +143,9 @@ async def lifespan(app: FastAPI):
     #     genai.configure(api_key=gemini_api_key)
     #     print("✅ Gemini API configured")
     print("✅ Building Retriever")
-    retriever = await rebuild_embeddings("./chroma_db_latest", "./docstore.json")
+    # retriever = await rebuild_embeddings("./chroma_db_latest", "./docstore.json")
+    retriever = await rebuild_embeddings("./chroma_db_final", "./docstore_final.json")
+
 
 
     global elevenlabs_client
@@ -187,12 +210,20 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # Allow frontend access
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],  # You can restrict to specific domains
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # You can restrict to specific domains
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*","ngrok-skip-browser-warning"],
 )
 
 
@@ -204,6 +235,155 @@ def ask_gemini_stream(prompt: str):
     response = llm.invoke([HumanMessage(content=prompt)])
       
     return response.content
+
+
+def ask_gemini_multimodal(prompt: str, image_paths: List[str] = None):
+    """Generate response using Gemini with multimodal support (text + images)"""
+    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0.7)
+    # Build content list
+    content = [{"type": "text", "text": prompt}]
+    # Add images if provided
+    if image_paths:
+        for img_path in image_paths:
+            if os.path.exists(img_path):
+                # Read and encode image
+                with open(img_path, "rb") as img_file:
+                    img_bytes = img_file.read()
+                    img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+                    # Determine mime type
+                    ext = img_path.split('.')[-1].lower()
+                    mime_type = f"image/{'jpeg' if ext in ['jpg', 'jpeg'] else ext}"
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{img_base64}"}
+                    })
+    response = llm.invoke([HumanMessage(content=content)])
+    return response.content
+
+
+
+
+def image_path_to_base64(image_path: str) -> str:
+    """Convert image file path to base64 string (without data URI prefix)"""
+    try:
+        if not os.path.exists(image_path):
+            return None
+        with open(image_path, "rb") as img_file:
+            img_bytes = img_file.read()
+            return base64.b64encode(img_bytes).decode('utf-8')
+    except Exception as e:
+        print(f"Error converting image to base64: {e}")
+        return None
+
+
+
+# def ask_gemini(prompt: str) -> str:
+#     try:
+#         model = genai.GenerativeModel(GEMINI_MODEL)
+#         response = model.generate_content(prompt)
+#         return response.text.strip()
+#     except Exception as e:
+#         return f"Error querying Gemini: {e}"
+
+
+def _clean_json_response(response: str) -> str:
+    if not response:
+        return ""
+    return response.replace("```json", "").replace("```", "").strip()
+
+
+def _safe_resolve_image_path(image_path_str: str) -> Optional[Path]:
+    candidate = Path(image_path_str)
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    try:
+        resolved = candidate.resolve()
+    except Exception:
+        return None
+    try:
+        resolved.relative_to(IMAGES_ROOT)
+    except ValueError:
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
+def _extract_page_number(image_path: Path) -> Optional[int]:
+    match = re.search(r"page_(\d+)", image_path.stem)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    
+
+def _encode_image_to_data_uri(image_path: Path) -> Optional[str]:
+    try:
+        byte_content = image_path.read_bytes()
+    except Exception:
+        return None
+    mime_type, _ = mimetypes.guess_type(str(image_path))
+    if not mime_type:
+        mime_type = "image/jpeg"
+    encoded = base64.b64encode(byte_content).decode("utf-8")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _build_image_question(
+    image_path: Path,
+    page_number: Optional[int],
+    chapter_title: str,
+    chapter_excerpt: str,
+) -> Optional[Dict[str, Any]]:
+    page_excerpt = ""
+    if page_number is not None:
+        page_excerpt = page_text_map.get(page_number, "")
+    if not page_excerpt:
+        page_excerpt = chapter_excerpt
+    prompt = f"""You are creating one open-ended quiz question for learners.
+The question must explicitly tell the learner to refer to an accompanying image from the chapter "{chapter_title}".
+Use the provided textbook excerpt to understand what the image is likely illustrating and craft a meaningful question that encourages explanation or analysis.
+Text excerpt:
+{page_excerpt[:1500]}
+Return exactly one JSON object with the following shape:
+{{
+  "question": "A single question that references the image (e.g., 'Refer to the image showing ... and explain ...').",
+  "answer_guidance": "One or two sentences describing the key ideas a strong answer should cover."
+}}
+Return only the JSON object."""
+    response = ask_gemini_stream(prompt)
+    if response.startswith("Error"):
+        return None
+    cleaned = _clean_json_response(response)
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+    question_text = payload.get("question", "")
+    if not question_text:
+        return None
+    answer_guidance = payload.get("answer_guidance", "").strip()
+    image_data_uri = _encode_image_to_data_uri(image_path)
+    if not image_data_uri:
+        return None
+    return {
+        "type": "image",
+        "question": question_text.strip(),
+        "answer_guidance": answer_guidance or None,
+        "image_data": image_data_uri,
+        "image_filename": image_path.name,
+        "page_number": page_number,
+    }
+
+
+
+
+
+
+
+
 
 
 @app.post("/api/upload-book")
@@ -235,17 +415,46 @@ async def rebuild():
 
 
 
+# Working 10/11/2025 ⬇️
+
+# @app.post("/api/ask")
+# async def ask_question(question: str = Form(...)):
+#     """
+#     Handle a POST request with a 'question' field and return AI-generated response + context.
+#     """
+#     try:
+#         # retriever = await rebuild_embeddings("./chroma_db_latest", "./docstore.json")
+
+#         response = await process_query(
+#             query=question,
+#             retriever=retriever,
+#             google_api_key=google_key_value,
+#         )
+
+#         return {
+#             "status": "success",
+#             "data": response,
+#         }
+
+#     except Exception as e:
+#         return {
+#             "status": "error",
+#             "message": str(e),
+#         }
+
 
 @app.post("/api/ask")
-async def ask_question(question: str = Form(...)):
+async def ask_question(request: ChatRequest): # Change from Form(...) to ChatRequest
     """
-    Handle a POST request with a 'question' field and return AI-generated response + context.
+    Handle a POST request with question, selected PDF, and conversation history.
     """
     try:
-        # retriever = await rebuild_embeddings("./chroma_db_latest", "./docstore.json")
+        # NOTE: You will need to manage the retriever loading/caching before this point.
+        # Assuming 'retriever' and 'google_key_value' are globally available or handled.
 
         response = await process_query(
-            query=question,
+            query=request.question,              # Pass the new question
+            messages=request.messages,           # <-- NEW: Pass the conversation history
             retriever=retriever,
             google_api_key=google_key_value,
         )
@@ -268,118 +477,120 @@ async def ask_question(question: str = Form(...)):
 
 
 
-# --- Route: Generate Quiz (Dynamic Questions Only) ---
-@app.post("/api/quiz/generate")
-async def generate_quiz(req: QuizGenerateRequest) -> Dict[str, Any]:
-    if not chapters:
-        return {"error": "Chapter data not loaded. Please check server logs."}
+
+
+# # --- Route: Generate Quiz (Dynamic Questions Only) ---
+# @app.post("/api/quiz/generate")
+# async def generate_quiz(req: QuizGenerateRequest) -> Dict[str, Any]:
+#     if not chapters:
+#         return {"error": "Chapter data not loaded. Please check server logs."}
     
-    chapter_value = req.chapter
+#     chapter_value = req.chapter
     
-    # Extract chapter number
-    try:
-        ch_num = int(chapter_value.replace("chapter", ""))
-    except ValueError:
-        return {"error": "Invalid chapter format. Expected 'chapterN' (e.g., 'chapter1')."}
+#     # Extract chapter number
+#     try:
+#         ch_num = int(chapter_value.replace("chapter", ""))
+#     except ValueError:
+#         return {"error": "Invalid chapter format. Expected 'chapterN' (e.g., 'chapter1')."}
 
-    # Find matching chapter
-    chapter_data = next((ch for ch in chapters if ch["chapter_number"] == ch_num), None)
-    if not chapter_data:
-        return {"error": f"Chapter {ch_num} not found in the database."}
+#     # Find matching chapter
+#     chapter_data = next((ch for ch in chapters if ch["chapter_number"] == ch_num), None)
+#     if not chapter_data:
+#         return {"error": f"Chapter {ch_num} not found in the database."}
 
-    chapter_text = chapter_data["chapter_text"]
+#     chapter_text = chapter_data["chapter_text"]
     
-    # Generate questions using Gemini
-    prompt = f"""Based on the following chapter content, generate exactly 5 open-ended questions that test understanding of key concepts.
+#     # Generate questions using Gemini
+#     prompt = f"""Based on the following chapter content, generate exactly 5 open-ended questions that test understanding of key concepts.
 
-Requirements:
-- Questions should be clear and specific
-- Questions should require explanatory answers (not yes/no)
-- Cover different topics from the chapter
-- Return ONLY a JSON array of questions in this exact format:
-[
-  {{"question": "Question text here"}},
-  {{"question": "Question text here"}},
-  ...
-]
+# Requirements:
+# - Questions should be clear and specific
+# - Questions should require explanatory answers (not yes/no)
+# - Cover different topics from the chapter
+# - Return ONLY a JSON array of questions in this exact format:
+# [
+#   {{"question": "Question text here"}},
+#   {{"question": "Question text here"}},
+#   ...
+# ]
 
-Chapter Content:
-{chapter_text[:8000]}
+# Chapter Content:
+# {chapter_text[:8000]}
 
-Return only the JSON array, no additional text."""
+# Return only the JSON array, no additional text."""
     
-    try:
-        response = ask_gemini_stream(prompt)
+#     try:
+#         response = ask_gemini_stream(prompt)
         
-        # Parse JSON response
-        # Remove markdown code blocks if present
-        response = response.replace("```json", "").replace("```", "").strip()
-        questions = json.loads(response)
+#         # Parse JSON response
+#         # Remove markdown code blocks if present
+#         response = response.replace("```json", "").replace("```", "").strip()
+#         questions = json.loads(response)
         
-        return {
-            "questions": questions,
-            "chapter_number": ch_num,
-            "chapter_context": chapter_text[:8000]  # Send context for evaluation
-        }
-    except json.JSONDecodeError as e:
-        print(f"JSON parsing error: {e}")
-        print(f"Response was: {response}")
-        return {"error": "Failed to parse questions from AI response"}
-    except Exception as e:
-        print(f"Error generating quiz: {e}")
-        return {"error": f"Error generating quiz: {str(e)}"}
+#         return {
+#             "questions": questions,
+#             "chapter_number": ch_num,
+#             "chapter_context": chapter_text[:8000]  # Send context for evaluation
+#         }
+#     except json.JSONDecodeError as e:
+#         print(f"JSON parsing error: {e}")
+#         print(f"Response was: {response}")
+#         return {"error": "Failed to parse questions from AI response"}
+#     except Exception as e:
+#         print(f"Error generating quiz: {e}")
+#         return {"error": f"Error generating quiz: {str(e)}"}
 
 
-# --- Route: Evaluate Answer ---
-@app.post("/api/quiz/evaluate")
-async def evaluate_answer(req: AnswerEvaluationRequest) -> Dict[str, Any]:
-    question = req.question
-    user_answer = req.user_answer
-    chapter_context = req.chapter_context
+# # --- Route: Evaluate Answer ---
+# @app.post("/api/quiz/evaluate")
+# async def evaluate_answer(req: AnswerEvaluationRequest) -> Dict[str, Any]:
+#     question = req.question
+#     user_answer = req.user_answer
+#     chapter_context = req.chapter_context
     
-    if not user_answer.strip():
-        return {"error": "Please provide an answer"}
+#     if not user_answer.strip():
+#         return {"error": "Please provide an answer"}
     
-    prompt = f"""You are an expert tutor evaluating a student's answer.
+#     prompt = f"""You are an expert tutor evaluating a student's answer.
 
-Context from the chapter:
-{chapter_context}
+# Context from the chapter:
+# {chapter_context}
 
-Question:
-{question}
+# Question:
+# {question}
 
-Student's Answer:
-{user_answer}
+# Student's Answer:
+# {user_answer}
 
-Please evaluate the answer and provide:
-1. An accuracy score (0-100%)
-2. Detailed feedback on what was correct and what was missing and do not add or mention student answer.
-3. An improved/model answer keep it short and to the point
+# Please evaluate the answer and provide:
+# 1. An accuracy score (0-100%)
+# 2. Detailed feedback on what was correct and what was missing and do not add or mention student answer.
+# 3. An improved/model answer keep it short and to the point
 
-Return your response in this EXACT JSON format:
-{{
-  "score": <number between 0-100>,
-  "feedback": "<detailed feedback text>",
-  "improved_answer": "<model answer text>"
-}}
+# Return your response in this EXACT JSON format:
+# {{
+#   "score": <number between 0-100>,
+#   "feedback": "<detailed feedback text>",
+#   "improved_answer": "<model answer text>"
+# }}
 
-Return only the JSON object, no additional text."""
+# Return only the JSON object, no additional text."""
     
-    try:
-        response = ask_gemini_stream(prompt)
+#     try:
+#         response = ask_gemini_stream(prompt)
         
-        # Clean response
-        response = response.replace("```json", "").replace("```", "").strip()
-        evaluation = json.loads(response)
+#         # Clean response
+#         response = response.replace("```json", "").replace("```", "").strip()
+#         evaluation = json.loads(response)
         
-        return evaluation
-    except json.JSONDecodeError as e:
-        print(f"JSON parsing error: {e}")
-        print(f"Response was: {response}")
-        return {"error": "Failed to parse evaluation from AI response"}
-    except Exception as e:
-        print(f"Error evaluating answer: {e}")
-        return {"error": f"Error evaluating answer: {str(e)}"}
+#         return evaluation
+#     except json.JSONDecodeError as e:
+#         print(f"JSON parsing error: {e}")
+#         print(f"Response was: {response}")
+#         return {"error": "Failed to parse evaluation from AI response"}
+#     except Exception as e:
+#         print(f"Error evaluating answer: {e}")
+#         return {"error": f"Error evaluating answer: {str(e)}"}
 
 
 
@@ -387,11 +598,10 @@ Return only the JSON object, no additional text."""
 def get_chapters():
     if not chapters:
         return {"chapters": []}
-    
     chapter_list = [
         {
             "number": ch["chapter_number"],
-            "title": ch.get("title", f"{ch['chapter_title']}"),
+            "title": ch.get("chapter_title") or ch.get("title") or f"Chapter {ch['chapter_number']}",
             "value": f"chapter{ch['chapter_number']}"
         }
         for ch in chapters
@@ -802,3 +1012,332 @@ async def home():
 @app.get("/health")
 def home():
     return {"message": "📘 Multimodal RAG API is running!"}
+
+
+
+
+# # --- Route: Generate Quiz (Dynamic Questions Only) ---
+# @app.post("/api/quiz/generate")
+# async def generate_quiz(req: QuizGenerateRequest) -> Dict[str, Any]:
+#     if not chapters:
+#         return {"error": "Chapter data not loaded. Please check server logs."}
+#     chapter_value = req.chapter
+#     # Extract chapter number
+#     try:
+#         ch_num = int(chapter_value.replace("chapter", ""))
+#     except ValueError:
+#         return {"error": "Invalid chapter format. Expected 'chapterN' (e.g., 'chapter1')."}
+#     # Find matching chapter
+#     chapter_data = next((ch for ch in chapters if ch["chapter_number"] == ch_num), None)
+#     if not chapter_data:
+#         return {"error": f"Chapter {ch_num} not found in the database."}
+#     chapter_text = chapter_data["chapter_text"]
+#     # Generate questions using Gemini
+#     prompt = f"""Based on the following chapter content, generate exactly 5 open-ended questions that test understanding of key concepts.
+# Requirements:
+# - Questions should be clear and specific
+# - Questions should require explanatory answers (not yes/no)
+# - Cover different topics from the chapter
+# - Return ONLY a JSON array of questions in this exact format:
+# [
+#   {{"question": "Question text here"}},
+#   {{"question": "Question text here"}},
+#   ...
+# ]
+# Chapter Content:
+# {chapter_text[:8000]}
+# Return only the JSON array, no additional text."""
+#     try:
+#         response = ask_gemini_stream(prompt)
+#         # Parse JSON response
+#         # Remove markdown code blocks if present
+#         cleaned_response = _clean_json_response(response)
+#         raw_questions = json.loads(cleaned_response)
+#         chapter_title = (
+#             chapter_data.get("chapter_title")
+#             or chapter_data.get("title")
+#             or f"Chapter {ch_num}"
+#         )
+#         text_questions: List[Dict[str, Any]] = []
+#         if isinstance(raw_questions, list):
+#             for item in raw_questions:
+#                 question_text = None
+#                 if isinstance(item, dict):
+#                     question_text = item.get("question") or item.get("text")
+#                 elif isinstance(item, str):
+#                     question_text = item
+#                 if question_text:
+#                     text_questions.append(
+#                         {
+#                             "type": "text",
+#                             "question": question_text.strip(),
+#                         }
+#                     )
+#         image_questions: List[Dict[str, Any]] = []
+#         chapter_excerpt_for_images = chapter_text[:2000]
+#         image_paths = chapter_data.get("chapter_images") or []
+#         for image_path_str in image_paths:
+#             if len(image_questions) >= MAX_IMAGE_QUESTIONS:
+#                 break
+#             resolved_image = _safe_resolve_image_path(image_path_str)
+#             if not resolved_image:
+#                 continue
+#             page_number = _extract_page_number(resolved_image)
+#             image_question = _build_image_question(
+#                 image_path=resolved_image,
+#                 page_number=page_number,
+#                 chapter_title=chapter_title,
+#                 chapter_excerpt=chapter_excerpt_for_images,
+#             )
+#             if image_question:
+#                 image_questions.append(image_question)
+#         combined_questions = text_questions + image_questions
+#         return {
+#             "questions": combined_questions,
+#             "chapter_number": ch_num,
+#             "chapter_title": chapter_title,
+#             "chapter_context": chapter_text[:8000]  # Send context for evaluation
+#         }
+#     except json.JSONDecodeError as e:
+#         print(f"JSON parsing error: {e}")
+#         print(f"Response was: {response}")
+#         return {"error": "Failed to parse questions from AI response"}
+#     except Exception as e:
+#         print(f"Error generating quiz: {e}")
+#         return {"error": f"Error generating quiz: {str(e)}"}
+    
+
+@app.post("/api/quiz/generate")
+async def generate_quiz(req: QuizGenerateRequest) -> Dict[str, Any]:
+    if not chapters:
+        return {"error": "Chapter data not loaded. Please check server logs."}
+
+    chapter_value = req.chapter
+
+    # Extract chapter number
+    try:
+        ch_num = int(chapter_value.replace("chapter", ""))
+    except ValueError:
+        return {"error": "Invalid chapter format. Expected 'chapterN' (e.g., 'chapter1')."}
+
+    # Find matching chapter
+    chapter_data = next((ch for ch in chapters if ch["chapter_number"] == ch_num), None)
+    if not chapter_data:
+        return {"error": f"Chapter {ch_num} not found in the database."}
+
+    chapter_text = chapter_data["chapter_text"]
+    chapter_images = chapter_data.get("chapter_images", [])
+
+    # Filter out empty or missing images
+    valid_images = [img for img in chapter_images if img and os.path.exists(img)]
+
+    all_questions = []
+
+    try:
+        # --- Generate 5 text-based questions ---
+        text_prompt = f"""Based on the following chapter content, generate exactly 5 open-ended questions that test understanding of key concepts.
+Requirements:
+- Questions should be clear and specific
+- Questions should require explanatory answers (not yes/no)
+- Cover different topics from the chapter
+- Return ONLY a JSON array of questions in this exact format:
+[
+  {{"question": "Question text here"}},
+  {{"question": "Question text here"}},
+  {{"question": "Question text here"}},
+  {{"question": "Question text here"}},
+  {{"question": "Question text here"}}
+]
+Chapter Content:
+{chapter_text[:8000]}
+Return only the JSON array, no additional text."""
+        text_response = ask_gemini_stream(text_prompt)
+        text_response = text_response.replace("```json", "").replace("```", "").strip()
+        text_questions = json.loads(text_response)
+
+        # Add metadata
+        for q in text_questions:
+            q["type"] = "text"
+            q["image_base64"] = None
+
+        all_questions.extend(text_questions)
+
+        # --- Generate up to 3 image-based questions ---
+        if valid_images:
+            selected_images = valid_images[:3]  # ✅ exactly 3 if available
+            for img_path in selected_images:
+                try:
+                    img_prompt = f"""Based on the image provided and the following chapter context, generate exactly 1 open-ended question that tests understanding of concepts shown in the image.
+Requirements:
+- The question should be directly related to what is shown in the image
+- The question should be specific and focus on all parts of the image including minor things
+- The question should require an explanatory answer
+- Return ONLY a JSON object in this format:
+{{"question": "Question text here"}}
+Chapter Context (for reference):
+{chapter_text[:4000]}
+Return only the JSON object, no additional text."""
+                    img_response = ask_gemini_multimodal(img_prompt, [img_path])
+                    img_response = img_response.replace("```json", "").replace("```", "").strip()
+                    img_question = json.loads(img_response)
+                    img_question["type"] = "image"
+                    img_question["image_base64"] = image_path_to_base64(img_path)
+                    all_questions.append(img_question)
+                except Exception as e:
+                    print(f"Error generating question for image {img_path}: {e}")
+                    continue
+
+        # --- Ensure we have 8 questions total (5 text + 3 image) ---
+        if len(all_questions) < 8:
+            remaining = 8 - len(all_questions)
+            fill_prompt = f"""Based on the following chapter content, generate exactly {remaining} more open-ended questions that test understanding of key concepts.
+Requirements:
+- Questions should be clear and specific
+- Questions should require explanatory answers (not yes/no)
+- Return ONLY a JSON array of questions in this format:
+[
+  {{"question": "Question text here"}},
+  ...
+]
+Chapter Content:
+{chapter_text[:8000]}
+Return only the JSON array, no additional text."""
+            fill_response = ask_gemini_stream(fill_prompt)
+            fill_response = fill_response.replace("```json", "").replace("```", "").strip()
+            fill_questions = json.loads(fill_response)
+            if isinstance(fill_questions, dict):
+                fill_questions = [fill_questions]
+            for q in fill_questions[:remaining]:
+                q["type"] = "text"
+                q["image_base64"] = None
+                all_questions.append(q)
+
+        # ✅ limit final output to exactly 8
+        all_questions = all_questions[:8]
+
+        return {
+            "questions": all_questions,
+            "chapter_number": ch_num,
+            "chapter_context": chapter_text[:8000]
+        }
+
+    except json.JSONDecodeError as e:
+        print(f"JSON parsing error: {e}")
+        return {"error": "Failed to parse questions from AI response"}
+    except Exception as e:
+        print(f"Error generating quiz: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": f"Error generating quiz: {str(e)}"}
+
+
+
+
+
+
+
+
+# --- Route: Evaluate Answer ---
+# @app.post("/api/quiz/evaluate")
+# async def evaluate_answer(req: AnswerEvaluationRequest) -> Dict[str, Any]:
+#     question = req.question
+#     user_answer = req.user_answer
+#     chapter_context = req.chapter_context
+#     if not user_answer.strip():
+#         return {"error": "Please provide an answer"}
+#     prompt = f"""You are an expert tutor evaluating a student's answer.
+# Context from the chapter:
+# {chapter_context}
+# Question:
+# {question}
+# Student's Answer:
+# {user_answer}
+# Please evaluate the answer and provide:
+# 1. An accuracy score (0-100%)
+# 2. Detailed feedback on what was correct and what was missing
+# 3. An improved/model answer
+# Return your response in this EXACT JSON format:
+# {{
+#   "score": <number between 0-100>,
+#   "feedback": "<detailed feedback text>",
+#   "improved_answer": "<model answer text>"
+# }}
+# Return only the JSON object, no additional text.
+# You MUST NOT include or mention the student answers or anything like this in your response.
+# """
+#     try:
+#         response = ask_gemini_stream(prompt)
+#         # Clean response
+#         response = response.replace("```json", "").replace("```", "").strip()
+#         evaluation = json.loads(response)
+#         return evaluation
+#     except json.JSONDecodeError as e:
+#         print(f"JSON parsing error: {e}")
+#         print(f"Response was: {response}")
+#         return {"error": "Failed to parse evaluation from AI response"}
+#     except Exception as e:
+#         print(f"Error evaluating answer: {e}")
+#         return {"error": f"Error evaluating answer: {str(e)}"}
+
+
+
+@app.post("/api/quiz/evaluate")
+async def evaluate_answer(req: AnswerEvaluationRequest) -> Dict[str, Any]:
+    question = req.question
+    user_answer = req.user_answer
+    chapter_context = req.chapter_context
+    image_base64 = req.image_base64
+    if not user_answer.strip():
+        return {"error": "Please provide an answer"}
+    prompt = f"""You are an expert tutor evaluating a student's answer.
+Context from the chapter:
+{chapter_context}
+Question:
+{question}
+Student's Answer:
+{user_answer}
+Please evaluate the answer and provide:
+1. An accuracy score (0-100%)
+2. Detailed feedback on what was correct and what was missing and do not add or mention student answer.
+3. An improved/model answer keep it short and to the point
+{"Note: This question includes an image. Consider the image content when evaluating the answer." if image_base64 else ""}
+Return your response in this EXACT JSON format:
+{{
+  "score": <number between 0-100>,
+  "feedback": "<detailed feedback text>",
+  "improved_answer": "<model answer text>"
+}}
+Return only the JSON object, no additional text. and dont mention "that the student" anywhere in the response"""
+    try:
+        # Use multimodal evaluation if image is provided
+        if image_base64:
+            # Convert base64 string to image file temporarily for multimodal API
+            import tempfile
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
+                img_bytes = base64.b64decode(image_base64)
+                tmp_file.write(img_bytes)
+                tmp_path = tmp_file.name
+            try:
+                response = ask_gemini_multimodal(prompt, [tmp_path])
+            finally:
+                # Clean up temp file
+                try:
+                    os.unlink(tmp_path)
+                except:
+                    pass
+        else:
+            response = ask_gemini_stream(prompt)
+        # Clean response
+        response = response.replace("```json", "").replace("```", "").strip()
+        evaluation = json.loads(response)
+        print(evaluation)
+        return evaluation
+    except json.JSONDecodeError as e:
+        print(f"JSON parsing error: {e}")
+        print(f"Response was: {response}")
+        return {"error": "Failed to parse evaluation from AI response"}
+    except Exception as e:
+        print(f"Error evaluating answer: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": f"Error evaluating answer: {str(e)}"}

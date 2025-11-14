@@ -15,16 +15,18 @@ from langchain_community.vectorstores import Chroma
 from langchain_core.stores import InMemoryStore
 from langchain_core.documents import Document
 from langchain_google_genai import ChatGoogleGenerativeAI 
-from langchain_core.messages import HumanMessage,SystemMessage
+from langchain_core.messages import HumanMessage,SystemMessage,AIMessage
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from typing import Dict,Any,AsyncGenerator
-
+from typing import Dict,Any,AsyncGenerator,List
+from pydantic import BaseModel
 
 nest_asyncio.apply()
 
 
-
+class ChatMessage(BaseModel):
+    role: str # 'user' or 'assistant'
+    content: str
 
 
 CHROMA_DB_PATH = "./chroma_db_latest"
@@ -64,82 +66,58 @@ def display_base64_image(b64_str):
 
 
 
-# ---- Function to build the multimodal prompt ----
-# def build_prompt(kwargs):
-#     docs_by_type = kwargs["context"]
-#     user_question = kwargs["question"]
 
-#     context_text = ""
-#     if len(docs_by_type["texts"]) > 0:
-#         for text_element in docs_by_type["texts"]:
-#             # if text elements are Document objects
-#             if hasattr(text_element, "page_content"):
-#                 context_text += text_element.page_content
-#             elif hasattr(text_element, "text"):
-#                 context_text += text_element.text
-#             else:
-#                 context_text += str(text_element)
-
-#     # Base text part of prompt
-#     prompt_template = f"""
-#     Answer the question based only on the following context, which can include text, tables, and images.
-
-#     Context: {context_text}
-#     Question: {user_question}
-#     """
-
-#     # The prompt content (text + base64 images)
-#     prompt_content = [{"type": "text", "text": prompt_template}]
-
-#     if len(docs_by_type["images"]) > 0:
-#         for image in docs_by_type["images"]:
-#             prompt_content.append(
-#                 {
-#                     "type": "image_url",
-#                     "image_url": {"url": f"data:image/jpeg;base64,{image}"},
-#                 }
-#             )
-
-#     # Return ChatPromptTemplate
-#     return ChatPromptTemplate.from_messages(
-#         [
-#             HumanMessage(content=prompt_content),
-#         ]
-#     )
 
 def build_prompt(kwargs):
     docs_by_type = kwargs["context"]
     user_question = kwargs["question"]
+    chat_history = kwargs["history"] # <-- NEW: Get the history
 
-    # --- START OF MODIFICATION ---
-    # 1. Define the strict refusal instruction
     system_instruction = """
     Your answer MUST be based SOLELY on the provided Context: text, tables, and images. 
     If the context does not contain the answer, you MUST respond with the exact and complete phrase: 
     "The information is not available in the provided knowledge base." 
+
+    Exception: 
+    If the user's message is a greeting, farewell, or polite small-talk (e.g., "hi", "hello", "how are you", "thanks", "bye"),
+    respond naturally and politely (e.g., "Hello! How can I help you today?").
     DO NOT mention based on the context or provided context or any other wording in the response.
     DO NOT use your general knowledge. Be concise.
     """
-    # --- END OF MODIFICATION ---
-
+    
+    # 1. Start with the System instruction
+    prompt_messages = [SystemMessage(content=system_instruction)]
+    
+    # 2. Add the previous messages (History)
+    prompt_messages.extend(chat_history) 
+    
+    # 3. Compile the new context and current question for the LLM
     context_text = ""
+    # ... (Your context_text compilation logic remains the same) ...
     if len(docs_by_type["texts"]) > 0:
         for text_element in docs_by_type["texts"]:
-            # if text elements are Document objects
-            if hasattr(text_element, "page_content"):
-                context_text += text_element.page_content
-            elif hasattr(text_element, "text"):
-                context_text += text_element.text
-            else:
-                context_text += str(text_element)
+             # ... (logic to extract page_content or text) ...
+             if hasattr(text_element, "page_content"):
+                 context_text += text_element.page_content
+             elif hasattr(text_element, "text"):
+                 context_text += text_element.text
+             else:
+                 context_text += str(text_element)
 
-    # Base text part of prompt now just includes the context and question
+    # prompt_template = f"""
+
+    # Context: {context_text}
+    # Question: {user_question}
+    # """
+
     prompt_template = f"""
+    Answer the question based only on the following context, which can include text, tables, and images
+    Make sure to answer correctly to user queries about past conversations aka context_text.
     Context: {context_text}
     Question: {user_question}
     """
 
-    # The prompt content (text + base64 images)
+    # 4. Compile the final HumanMessage with context and images
     prompt_content = [{"type": "text", "text": prompt_template}]
 
     if len(docs_by_type["images"]) > 0:
@@ -151,64 +129,114 @@ def build_prompt(kwargs):
                 }
             )
 
-    # Return ChatPromptTemplate with the new SystemMessage
-    # You will need to ensure SystemMessage and HumanMessage are imported 
-    # (e.g., from langchain_core.messages import SystemMessage, HumanMessage)
-    return ChatPromptTemplate.from_messages(
-        [
-            # --- START OF MODIFICATION ---
-            SystemMessage(content=system_instruction),
-            # --- END OF MODIFICATION ---
-            HumanMessage(content=prompt_content),
-        ]
-    )
+    # 5. Add the final HumanMessage (the current user turn)
+    prompt_messages.append(HumanMessage(content=prompt_content))
+
+    # Return the ChatPromptTemplate containing the full message list
+    return ChatPromptTemplate.from_messages(prompt_messages)
 
 
 
 
-async def make_retiever_structure(retriever,google_api_key):
+# Working 10/11/2025 ⬇️ single query
+
+
+# async def make_retiever_structure(retriever,google_api_key):
         
-        llm1 = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",  # or gemini-1.5-pro for better reasoning
+#         llm1 = ChatGoogleGenerativeAI(
+#         model="gemini-2.5-flash",  # or gemini-1.5-pro for better reasoning
+#         temperature=0.3,
+#         google_api_key=google_api_key,
+#         )
+
+
+#         # ---- Define the runnable chain ----
+#         chain_rebuild = (
+#             {
+#                 "context": retriever | RunnableLambda(parse_docs),
+#                 "question": RunnablePassthrough(),
+#             }
+#             | RunnableLambda(build_prompt)
+#             | llm1
+#             | StrOutputParser()
+#         )
+
+
+#         # ---- Optional: Chain that also returns sources ----
+#         chain_with_sources_rebuild = (
+#             {
+#                 "context": retriever | RunnableLambda(parse_docs),
+#                 "question": RunnablePassthrough(),
+#             }
+#             | RunnablePassthrough().assign(
+#                 response=(RunnableLambda(build_prompt) | llm1 | StrOutputParser())
+#             )
+#         )
+
+#         print("✅ Gemini multimodal chain ready!")
+
+#         return chain_with_sources_rebuild
+
+
+async def make_retiever_structure(retriever, google_api_key, messages: List[ChatMessage]): # <-- UPDATED SIGNATURE
+        
+    llm1 = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
         temperature=0.3,
         google_api_key=google_api_key,
+    )
+
+    # Convert the messages list to LangChain's format (HumanMessage/AIMessage)
+    # def format_history(history: List[Dict[str, str]]):
+    #     formatted_messages = []
+    #     for msg in history:
+    #         role = msg.get('role')
+    #         content = msg.get('content', '')
+    #         if role == 'user':
+    #             formatted_messages.append(HumanMessage(content=content))
+    #         elif role == 'assistant':
+    #             # Note: Assuming 'assistant' messages are text only for history
+    #             formatted_messages.append(SystemMessage(content=content)) 
+    #     return formatted_messages
+    count = 0
+    def format_history(history: List[ChatMessage]):  # Change type hint
+        formatted_messages = []
+        for msg in history:
+            # Use dot notation for Pydantic models, not .get()
+            role = msg.role
+            content = msg.content
+            
+            if role == 'user':
+                formatted_messages.append(HumanMessage(content=content))
+            elif role == 'assistant':
+                formatted_messages.append(AIMessage(content=content))  # Use AIMessage, not SystemMessage
+        return formatted_messages
+
+    # Define a custom input dictionary that includes the formatted history
+    chain_input = {
+        "context": retriever | RunnableLambda(parse_docs),
+        "question": RunnablePassthrough(),
+        "history": RunnableLambda(lambda x: format_history(messages)) # Pass history
+    }
+
+    print(messages)
+
+    # ---- Optional: Chain that also returns sources ----
+    chain_with_sources_rebuild = (
+        chain_input
+        | RunnablePassthrough().assign(
+            response=(RunnableLambda(build_prompt) | llm1 | StrOutputParser())
         )
+    )
 
-
-        # ---- Define the runnable chain ----
-        chain_rebuild = (
-            {
-                "context": retriever | RunnableLambda(parse_docs),
-                "question": RunnablePassthrough(),
-            }
-            | RunnableLambda(build_prompt)
-            | llm1
-            | StrOutputParser()
-        )
-
-
-        # ---- Optional: Chain that also returns sources ----
-        chain_with_sources_rebuild = (
-            {
-                "context": retriever | RunnableLambda(parse_docs),
-                "question": RunnablePassthrough(),
-            }
-            | RunnablePassthrough().assign(
-                response=(RunnableLambda(build_prompt) | llm1 | StrOutputParser())
-            )
-        )
-
-        print("✅ Gemini multimodal chain ready!")
-
-        return chain_with_sources_rebuild
+    print("✅ Gemini multimodal chat chain ready!")
+    return chain_with_sources_rebuild
 
 
 
 
 async def process_images(images, google_api_key):
-    prompt_template = """Describe the image in detail. For context,
-                     the image is part of a research paper explaining the transformers
-                        architecture. Be specific about graphs, such as bar plots."""
+    prompt_template = """Describe the image in detail. For context, this image is from a marine refrigeration and air conditioning technical manual used in maritime engineering education. Be specific about graphs, such as bar plots and any other components given inside an image."""
     messages = [
         (
             "user",
@@ -314,6 +342,8 @@ async def generate_save_embeddings(CHROMA_PATH,DOCSTORE_PATH,embedding_model, te
 
         print(f"Data saved: Chroma DB to {CHROMA_PATH} and Document Store to {DOCSTORE_PATH}")
 
+        return retriever
+
 
 
 
@@ -413,7 +443,7 @@ async def rebuild_embeddings(chroma_path,doc_path):
     try:
 
         vectorstore = Chroma(
-        collection_name="multi_modal_rag",
+        collection_name="multi_modal_final_rag",
         embedding_function=GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL),
         persist_directory=chroma_path,
         )
@@ -532,42 +562,181 @@ async def rebuild_embeddings(chroma_path,doc_path):
 
 
 
-async def process_query(query: str, retriever, google_api_key: str) -> Dict[str, Any]:
+# async def process_query(query: str,messages: List[Dict[str, str]], retriever, google_api_key: str) -> Dict[str, Any]:
+#     """
+#     Process a user query, retrieve relevant context, and query the Gemini multimodal chain.
+#     """
+#     # Define the refusal phrase (must match the instruction in build_prompt)
+#     REFUSAL_PHRASE = "The information is not available in the provided knowledge base."
+
+
+
+#     # 1. Handle Conversational/Trivial Queries First
+#     trivial_response = None
+#     if query.lower() in ['hi', 'hello', 'how are u']:
+#         trivial_response = "Hello! I'm your AI assistant. How can I help you today?"
+#     elif query.lower() in ['thanks', 'good', 'amazing']:
+#         trivial_response = "Welcome! Is there anything else i can help u with?"
+
+#     if trivial_response:
+#         return {
+#             "answer": trivial_response,
+#             "context_texts": [],
+#             "context_images": [],
+#         }
+
+#     # chain_with_sources = await make_retiever_structure(retriever, google_api_key)
+#     chain_with_sources = await make_retiever_structure(retriever, google_api_key,messages)
+
+
+#     # Run the chain
+#     response = chain_with_sources.invoke(query)
+
+#     answer = response.get("response", "No answer generated.")
+
+
+#     if answer in ["Hello! How can I help you today?",'Welcome! Is there anything else I can help you with?', "Hello! I'm your AI assistant. How can I help you today?"]:
+#         final_response = {
+#         "answer": answer,
+#         "context_texts": [],
+#         "context_images": [],
+#     }
+    
+#     # Initialize response structure with the answer
+#     final_response = {
+#         "answer": answer,
+#         "context_texts": [],
+#         "context_images": [],
+#     }
+
+#     # --- Core Correction Logic: Determine which contexts to process ---
+#     if answer.strip().startswith(REFUSAL_PHRASE):
+#         # If model refuses, we process EMPTY lists (no context shown)
+#         context_texts_to_process = []
+#         context_images_to_process = []
+#     else:
+#         # If model answers, we process the retrieved lists
+#         context_texts_to_process = response.get("context", {}).get("texts", [])
+#         context_images_to_process = response.get("context", {}).get("images", [])
+#     # ------------------------------------------------------------------
+
+#     # Extract text contexts from the determined list (either retrieved or empty)
+#     for text in context_texts_to_process:
+#         text_entry = {}
+
+#         if hasattr(text, "page_content"):
+#             text_entry["content"] = text.page_content
+#         elif hasattr(text, "text"):
+#             text_entry["content"] = text.text
+#         else:
+#             text_entry["content"] = str(text)
+
+#         metadata = getattr(text, "metadata", {}) or {}
+#         text_entry["page_number"] = metadata.get("page_number", None)
+
+#         final_response["context_texts"].append(text_entry)
+
+#     # Extract image contexts from the determined list (either retrieved or empty)
+#     # NOTE: You must have 'import base64' at the top of your file for this to work.
+#     for image in context_images_to_process:
+#         # ensure it's base64-encoded string (no display)
+#         if isinstance(image, bytes):
+#             image_b64 = base64.b64encode(image).decode("utf-8")
+#         elif isinstance(image, str):
+#             image_b64 = image
+#         else:
+#             continue
+#         final_response["context_images"].append(image_b64)
+
+#     # Return the complete structure outside of any conditional block
+#     return final_response
+
+
+
+
+async def is_greeting_or_smalltalk(query: str, google_api_key: str) -> tuple[bool, str]:
+    """
+    Use LLM to determine if query is greeting/small-talk, and generate appropriate response.
+    Returns: (is_trivial, response_text)
+    """
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        temperature=0.3,
+        google_api_key=google_api_key,
+    )
+    
+    classification_prompt = f"""Analyze this user message and determine if it's a greeting, farewell, or polite small-talk that doesn't require knowledge base lookup.
+
+Examples of greetings/small-talk: "hi", "hello", "how are you", "thanks", "thank you", "bye", "good morning", "what's up", "hey there", "appreciate it", "see you later"
+
+Examples of knowledge queries: "what is X", "explain Y", "show me Z", "tell me about", "how does", "when did"
+
+User message: "{query}"
+
+Respond in this EXACT format:
+CLASSIFICATION: [GREETING or QUERY]
+RESPONSE: [If GREETING, provide a natural polite response. If QUERY, write "N/A"]"""
+
+    result = llm.invoke(classification_prompt)
+    response_text = result.content.strip()
+    
+    # Parse the response
+    lines = response_text.split('\n')
+    classification = ""
+    response_msg = ""
+    
+    for line in lines:
+        if line.startswith("CLASSIFICATION:"):
+            classification = line.split(":", 1)[1].strip().upper()
+        elif line.startswith("RESPONSE:"):
+            response_msg = line.split(":", 1)[1].strip()
+    
+    is_trivial = classification == "GREETING"
+    
+    return is_trivial, response_msg if is_trivial else ""
+
+
+async def process_query(query: str, messages: List[Dict[str, str]], retriever, google_api_key: str) -> Dict[str, Any]:
     """
     Process a user query, retrieve relevant context, and query the Gemini multimodal chain.
     """
-    # Define the refusal phrase (must match the instruction in build_prompt)
     REFUSAL_PHRASE = "The information is not available in the provided knowledge base."
 
-    chain_with_sources = await make_retiever_structure(retriever, google_api_key)
-
-    # Run the chain
-    response = chain_with_sources.invoke(query)
-
-    answer = response.get("response", "No answer generated.")
     
-    # Initialize response structure with the answer
+
+    # Check if query is greeting/small-talk using LLM
+    is_trivial, trivial_response = await is_greeting_or_smalltalk(query, google_api_key)
+    
+    if is_trivial:
+        return {
+            "answer": trivial_response,
+            "context_texts": [],
+            "context_images": [],
+        }
+
+    # For knowledge queries, use the retriever chain
+    chain_with_sources = await make_retiever_structure(retriever, google_api_key, messages)
+    response = chain_with_sources.invoke(query)
+    answer = response.get("response", "No answer generated.")
+
+    # Initialize response structure
     final_response = {
         "answer": answer,
         "context_texts": [],
         "context_images": [],
     }
 
-    # --- Core Correction Logic: Determine which contexts to process ---
+    # Determine which contexts to process
     if answer.strip().startswith(REFUSAL_PHRASE):
-        # If model refuses, we process EMPTY lists (no context shown)
         context_texts_to_process = []
         context_images_to_process = []
     else:
-        # If model answers, we process the retrieved lists
         context_texts_to_process = response.get("context", {}).get("texts", [])
         context_images_to_process = response.get("context", {}).get("images", [])
-    # ------------------------------------------------------------------
 
-    # Extract text contexts from the determined list (either retrieved or empty)
+    # Extract text contexts
     for text in context_texts_to_process:
         text_entry = {}
-
         if hasattr(text, "page_content"):
             text_entry["content"] = text.page_content
         elif hasattr(text, "text"):
@@ -577,13 +746,10 @@ async def process_query(query: str, retriever, google_api_key: str) -> Dict[str,
 
         metadata = getattr(text, "metadata", {}) or {}
         text_entry["page_number"] = metadata.get("page_number", None)
-
         final_response["context_texts"].append(text_entry)
 
-    # Extract image contexts from the determined list (either retrieved or empty)
-    # NOTE: You must have 'import base64' at the top of your file for this to work.
+    # Extract image contexts
     for image in context_images_to_process:
-        # ensure it's base64-encoded string (no display)
         if isinstance(image, bytes):
             image_b64 = base64.b64encode(image).decode("utf-8")
         elif isinstance(image, str):
@@ -592,5 +758,4 @@ async def process_query(query: str, retriever, google_api_key: str) -> Dict[str,
             continue
         final_response["context_images"].append(image_b64)
 
-    # Return the complete structure outside of any conditional block
     return final_response

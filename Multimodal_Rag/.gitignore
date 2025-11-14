@@ -17,10 +17,7 @@ view.html
 websocket.py
 __init__.py
 __pycache__/
-chroma_db/
-chroma_db_final/
-chroma_db_latest/
-chroma_db_nomic/
+
 
 # Distribution / packaging
 .Python
